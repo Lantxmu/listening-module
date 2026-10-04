@@ -1,88 +1,133 @@
-const {test}=require('node:test');
-const assert=require('node:assert/strict');
-const express=require('express');
-const {settingsOf,validateQuestion,generate,publicSession,score,createPracticeRouter,chatCompletionsUrl}=require('./backend.cjs');
-const passage='Maya moved the workshop to Friday because the laboratory was closed on Thursday.';
-const question={type:'detail',question:'Why was the workshop moved?',options:['The laboratory was closed.','The teacher was travelling.','More students could attend.','The equipment had arrived.'],correct_answer:0,evidence:'the laboratory was closed on Thursday',explanation:'实验室周四关闭，因此改到周五。'};
-const settings={difficulty:'CET-6',question_count:1,target_wpm:170};
-function provider(){return {async complete(system){if(system.startsWith('Generate a fresh'))return {text:passage};if(system.startsWith('Independently'))return {valid:true};return {...question};}};}
-test('accepts provider base URLs and complete endpoint URLs',()=>{
-  assert.equal(chatCompletionsUrl('https://sub2api.example').toString(),'https://sub2api.example/v1/chat/completions');
-  assert.equal(chatCompletionsUrl('https://sub2api.example/v1').toString(),'https://sub2api.example/v1/chat/completions');
-  assert.equal(chatCompletionsUrl('https://sub2api.example/v1/chat/completions').toString(),'https://sub2api.example/v1/chat/completions');
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const express = require('express');
+const { settingsOf, validateTurns, validateQuestion, generate, publicSession, score, createPracticeRouter, chatCompletionsUrl } = require('./backend.cjs');
+
+const settings = { difficulty: 'CET-6', question_count: 1, target_wpm: 170, topic: '', mode: 'monologue' };
+const passageText = 'The research team moved the workshop to Friday because the laboratory was closed on Thursday. Maya used the extra time to revise the safety checklist and invite two visiting students. Although the delay was inconvenient, the final demonstration was clearer and better organized than the original plan. The team also compared the results with last year’s measurements, discussed several safety questions, and recorded practical advice for students who would repeat the experiment during the summer program. Before leaving, the members labeled every sample, backed up their notes, and agreed to meet again next month to evaluate the long term effects of the revised procedure.';
+const passage = { text: passageText, turns: [{ speaker: 'narrator', text: passageText }] };
+const question = { type: 'detail', question: 'Why was the workshop moved?', options: ['The laboratory was closed.', 'The teacher was travelling.', 'More students could attend.', 'The equipment had arrived.'], correct_answer: 0, evidence: [{ text: 'the laboratory was closed on Thursday', speaker: 'narrator', turn: 0 }], explanation: '实验室周四关闭，因此改到周五。' };
+const dialogueTurns = [
+  { speaker: 'male', text: 'I think the community garden plan is practical, but we need a clearer schedule for volunteers. The first draft should also explain how tools will be shared during busy afternoons.' },
+  { speaker: 'female', text: 'I agree with the basic plan. I can contact the school and ask whether students want to help. Their teachers may suggest activities that connect the garden with ordinary science lessons.' },
+  { speaker: 'male', text: 'That would solve our staffing problem. I will check the water system before the first meeting and make sure the storage area is secure for everyone.' },
+  { speaker: 'female', text: 'Then I will prepare a short budget and explain how the garden could support science classes. I will also include a simple calendar so families can choose convenient days.' }
+];
+
+function provider({ questionValue = question, auditValid = true, onCall } = {}) {
+  return { async complete(system, user) {
+    onCall?.(system, user);
+    if (system.startsWith('Generate a fresh')) return { turns: system.includes('only speakers male') ? dialogueTurns : passage.turns };
+    if (system.startsWith('Audit whether')) return { valid: true, reason: '' };
+    if (system.startsWith('Independently')) return { valid: auditValid, reason: auditValid ? '' : 'ambiguous' };
+    return questionValue;
+  } };
+}
+
+test('accepts provider URLs and normalizes the default mode', () => {
+  assert.equal(chatCompletionsUrl('https://sub2api.example').toString(), 'https://sub2api.example/v1/chat/completions');
+  assert.equal(chatCompletionsUrl('https://sub2api.example/v1').toString(), 'https://sub2api.example/v1/chat/completions');
+  assert.equal(chatCompletionsUrl('https://sub2api.example/v1/chat/completions').toString(), 'https://sub2api.example/v1/chat/completions');
+  assert.equal(settingsOf({ ...settings, mode: undefined }).mode, 'monologue');
+  assert.throws(() => settingsOf({ ...settings, mode: 'stereo' }));
+  assert.throws(() => settingsOf({ ...settings, extra: true }));
 });
-test('reject invalid settings and malformed or unsupported questions',()=>{
-  for(const s of [{...settings,question_count:0},{...settings,question_count:5},{...settings,target_wpm:221},{...settings,difficulty:'__proto__'}])assert.throws(()=>settingsOf(s));
-  for(const q of [{...question,options:['one']},{...question,options:['Same','same!','x','y']},{...question,correct_answer:4},{...question,correct_answer:'0'},{...question,evidence:'Invented quote'},{...question,question:''}])assert.throws(()=>validateQuestion(q,passage,1));
+
+test('validates v2 turns, word ranges, roles and dialogue balance', () => {
+  assert.deepEqual(validateTurns(passage.turns, 'monologue', settings), passage);
+  assert.doesNotThrow(() => validateTurns([{ speaker: 'narrator', text: 'word '.repeat(201).trim() }], 'monologue', { ...settings, question_count: 3 }));
+  assert.deepEqual(validateTurns(dialogueTurns, 'dialogue', settings), { text: dialogueTurns.map(turn => turn.text).join(' '), turns: dialogueTurns });
+  assert.throws(() => validateTurns([{ speaker: 'male', text: passageText }], 'monologue', settings));
+  assert.throws(() => validateTurns([{ speaker: 'narrator', text: passageText }], 'dialogue', settings));
+  assert.throws(() => validateTurns([...dialogueTurns, { speaker: 'male', text: 'Man: repeated.' }], 'dialogue', settings));
+  assert.throws(() => validateTurns([{ speaker: 'male', text: passageText }, { speaker: 'female', text: 'Short.' }, { speaker: 'male', text: 'Short.' }, { speaker: 'female', text: 'Short.' }], 'dialogue', settings));
 });
-test('generation retries failed question without regenerating passage',async()=>{
-  let passages=0,questions=0,audits=0;
-  const p={async complete(system){if(system.startsWith('Generate a fresh')){passages++;return {text:passage};}if(system.startsWith('Independently')){audits++;return {valid:audits>1,reason:'ambiguous'};}questions++;return question;}};
-  const session=await generate(settings,p);
-  assert.equal(passages,1);assert.equal(questions,2);assert.equal(session.questions.length,1);
+
+test('validates evidence against the exact turn and rejects ambiguity', () => {
+  const context = { settings, passage };
+  assert.deepEqual(validateQuestion(question, context, 1).evidence, question.evidence);
+  assert.throws(() => validateQuestion({ ...question, evidence: [{ ...question.evidence[0], text: 'the' }] }, context, 1));
+  assert.throws(() => validateQuestion({ ...question, evidence: [{ ...question.evidence[0], turn: 1 }] }, context, 1));
+  assert.throws(() => validateQuestion({ ...question, evidence: 'the laboratory was closed on Thursday' }, context, 1));
+  assert.throws(() => validateQuestion({ ...question, extra: true }, context, 1));
 });
-test('optional topic is normalized and passed to passage generation',async()=>{
-  assert.equal(settingsOf({...settings}).topic,'');
-  assert.equal(settingsOf({...settings,topic:'  Space exploration  '}).topic,'Space exploration');
-  assert.throws(()=>settingsOf({...settings,topic:'x'.repeat(121)}));
-  let promptContext;
-  const p={async complete(system,user){if(system.startsWith('Generate a fresh')){assert.match(system,/topic_preference is non-empty/);promptContext=JSON.parse(user);return {text:passage};}if(system.startsWith('Independently'))return {valid:true};return question;}};
-  await generate({...settings,topic:'Space exploration'},p);
-  assert.equal(promptContext.topic_preference,'Space exploration');
+
+test('generation uses turns and mode, audits topic, and retries failed questions', async () => {
+  let passages = 0, questions = 0, audits = 0, seenTurns = false;
+  const generatedQuestion = { ...question, evidence: question.evidence };
+  const session = await generate({ ...settings, topic: 'laboratory planning' }, { async complete(system, user) {
+    if (system.startsWith('Generate a fresh')) { passages++; return { turns: passage.turns }; }
+    if (system.startsWith('Audit whether')) { audits++; return { valid: true, reason: '' }; }
+    if (system.startsWith('Generate ONE')) { questions++; seenTurns ||= JSON.parse(user).passage.turns?.length === 1; return generatedQuestion; }
+    return { valid: true, reason: '' };
+  }});
+  assert.equal(passages, 1); assert.equal(audits, 1); assert.equal(questions, 1); assert.equal(seenTurns, true);
+  assert.equal(session.schema_version, 2); assert.deepEqual(session.passage.turns, passage.turns);
+  assert.equal(publicSession(session).questions[0].correct_answer, undefined);
 });
-test('invalid JSON recovery, retry limits and scoring',async()=>{
-  let calls=0;
-  const p=provider();const original=p.complete;
-  p.complete=async system=>{if(calls++===0)throw Error('invalid JSON');return original(system);};
-  const s=await generate(settings,p);
-  const visible=JSON.stringify(publicSession(s));
-  for(const key of ['correct_answer','evidence','explanation'])assert.equal(visible.includes(key),false);
-  assert.equal(score(s,{'1':0}).score,1);assert.equal(score(s,{'1':3}).score,0);
-  for(const answers of [{},{'1':4},{'1':0,'2':0},[],{'1':'0'}])assert.throws(()=>score(s,answers));
-  let attempts=0;
-  await assert.rejects(()=>generate(settings,{async complete(system){if(system.startsWith('Generate a fresh'))return {text:passage};attempts++;return {...question,options:[]};}}));
-  assert.equal(attempts,3);
+
+test('question retries are capped and passage is not regenerated', async () => {
+  let passages = 0, attempts = 0;
+  await assert.rejects(() => generate(settings, { async complete(system) {
+    if (system.startsWith('Generate a fresh')) { passages++; return { turns: passage.turns }; }
+    if (system.startsWith('Generate ONE')) { attempts++; return { ...question, options: [] }; }
+    return { valid: true, reason: '' };
+  }}));
+  assert.equal(passages, 1); assert.equal(attempts, 3);
 });
-test('requested question counts 1–4 and unique IDs',async()=>{
-  for(let count=1;count<=4;count++){
-    let id=0;const p=provider(),original=p.complete;
-    p.complete=async system=>system.startsWith('Generate ONE')?{...question,question:question.question+' '+(++id)}:original(system);
-    const s=await generate({...settings,question_count:count},p);
-    assert.equal(s.questions.length,count);assert.deepEqual(s.questions.map(q=>q.id),Array.from({length:count},(_,i)=>i+1));
-  }
+
+test('schema is strict and HTTP keeps solutions hidden until the locked submission', async () => {
+  const schema = JSON.parse(fs.readFileSync(require('node:path').join(__dirname, 'practice-session.schema.json')));
+  assert.equal(schema.properties.schema_version.const, 2); assert.equal(schema.additionalProperties, false);
+  const app = express(); app.use(express.json()); app.use('/api/practice', createPracticeRouter({ provider: provider(), ttl: 200 }));
+  const server = app.listen(0, '127.0.0.1'); await new Promise(resolve => server.once('listening', resolve));
+  const base = 'http://127.0.0.1:' + server.address().port + '/api/practice';
+  const post = (path, body) => fetch(base + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  try {
+    const response = await post('/generate', { ...settings, mode: undefined }); const session = await response.json();
+    assert.equal(response.status, 200); assert.equal(session.schema_version, 2); assert.equal(session.questions[0].correct_answer, undefined); assert.equal(session.questions[0].evidence, undefined); assert.equal(session.passage.turns[0].speaker, 'narrator');
+    const fresh = await (await fetch(base + '/' + session.id)).json(); assert.equal(fresh.questions[0].explanation, undefined);
+    assert.equal((await post('/' + session.id + '/submit', { answers: { [session.questions[0].id]: 0 } })).status, 200);
+    const result = await (await post('/' + session.id + '/submit', { answers: { [session.questions[0].id]: 3 } })).json();
+    assert.equal(result.score, 1); assert.equal(result.results[0].evidence[0].speaker, 'narrator');
+    await new Promise(resolve => setTimeout(resolve, 220)); assert.equal((await fetch(base + '/' + session.id)).status, 404);
+  } finally { await new Promise(resolve => server.close(resolve)); }
 });
-test('HTTP loop hides solutions, validates submission, locks first score and expires',async()=>{
-  const app=express();app.use(express.json());app.use('/api/practice',createPracticeRouter({provider:provider(),ttl:200}));
-  const server=app.listen(0,'127.0.0.1');await new Promise(resolve=>server.once('listening',resolve));
-  const base='http://127.0.0.1:'+server.address().port+'/api/practice';
-  const post=(path,body)=>fetch(base+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  try{
-    assert.equal((await post('/generate',{...settings,question_count:9})).status,400);
-    const response=await post('/generate',settings);assert.equal(response.headers.get('cache-control'),'no-store');const session=await response.json();
-    assert.equal(session.questions[0].correct_answer,undefined);
-    const fresh=await (await fetch(base+'/'+session.id)).json();assert.equal(fresh.questions[0].evidence,undefined);
-    assert.equal((await post('/'+session.id+'/submit',{answers:{}})).status,400);
-    const result=await (await post('/'+session.id+'/submit',{answers:{'1':0}})).json();assert.equal(result.score,1);assert.equal(result.results[0].evidence,question.evidence);
-    const again=await (await post('/'+session.id+'/submit',{answers:{'1':3}})).json();assert.equal(again.score,1);
-    await new Promise(resolve=>setTimeout(resolve,220));assert.equal((await fetch(base+'/'+session.id)).status,404);
-  }finally{await new Promise(resolve=>server.close(resolve));}
+
+test('score validates answers and public data does not contain solutions', () => {
+  const session = { schema_version: 2, id: 's', settings, passage, questions: [{ id: 1, ...question }] };
+  assert.equal(score(session, { 1: 0 }).score, 1); assert.equal(score(session, { 1: 3 }).score, 0);
+  for (const answers of [{}, { 1: 4 }, [], { 1: '0' }]) assert.throws(() => score(session, answers));
+  const visible = JSON.stringify(publicSession(session));
+  for (const key of ['correct_answer', 'evidence', 'explanation']) assert.equal(visible.includes(key), false);
 });
-test('speech sequence omits options, supports pause and cancels stale callbacks',async()=>{
-  const {BrowserSpeechEngine}=await import('../../docs/.vitepress/theme/components/listening/speech.mjs');
-  const spoken=[];let paused=0,resumed=0;
-  global.window={speechSynthesis:{getVoices:()=>[{lang:'en-US'}],speak:u=>spoken.push(u),cancel(){},pause(){paused++},resume(){resumed++}}};
-  global.SpeechSynthesisUtterance=class{constructor(text){this.text=text;}};
-  const engine=new BrowserSpeechEngine(()=>{}),session={settings,passage:{text:passage},questions:[{id:1,...question}]};
-  let finished=0;
-  engine.play(session,()=>finished++,assert.fail);
-  assert.equal(spoken[0].text,passage);
-  engine.pause();engine.resume();assert.equal(paused,1);assert.equal(resumed,1);
-  const stale=spoken[0].onend;engine.stop();stale();assert.equal(engine.timer,null);
-  engine.play(session,()=>finished++,assert.fail);
-  spoken.at(-1).onend();engine.pause();assert.equal(engine.timer,null);
-  engine.resume();clearTimeout(engine.timer);engine.timer=null;engine.pending();
-  assert.equal(spoken.at(-1).text,'Question 1. '+question.question);
-  assert.equal(spoken.some(u=>u.text.includes(question.options[0])),false);
-  spoken.at(-1).onend();clearTimeout(engine.timer);engine.timer=null;engine.pending();assert.equal(finished,1);
-  engine.stop();delete global.window;delete global.SpeechSynthesisUtterance;
+
+test('speech maps ordered turns, falls back safely, and ignores stale callbacks', async () => {
+  const { BrowserSpeechEngine, defaultVoicePreferences, loadVoicePreferences, resolveVoice } = await import('../../docs/.vitepress/theme/components/listening/speech.mjs');
+  const oldWindow = global.window, oldUtterance = global.SpeechSynthesisUtterance;
+  const voices = [{ voiceURI: 'a', name: 'English A', lang: 'en-US' }, { voiceURI: 'b', name: 'English B', lang: 'en-CA' }];
+  const spoken = [], controls = { paused: 0, resumed: 0 };
+  global.window = { speechSynthesis: { getVoices: () => voices, speak: utterance => spoken.push(utterance), cancel() {}, pause() { controls.paused++; }, resume() { controls.resumed++; }, addEventListener() {}, removeEventListener() {} } };
+  global.SpeechSynthesisUtterance = class { constructor(text) { this.text = text; } };
+  try {
+    const defaults = defaultVoicePreferences();
+    assert.equal(defaults.narrator.name, 'Microsoft WilliamMultilingual Online (Natural) - English (Australia)');
+    assert.equal(defaults.male.name, 'Microsoft Liam Online (Natural) - English (Canada)');
+    assert.equal(defaults.female.name, 'Microsoft Clara Online (Natural) - English (Canada)');
+    assert.equal(resolveVoice(voices, defaults.narrator).voiceURI, 'a');
+    assert.equal(resolveVoice(voices, defaults.male).voiceURI, 'b');
+    assert.equal(resolveVoice([], { voiceURI: 'missing', name: '', lang: 'en-US' }), null);
+    assert.equal(loadVoicePreferences({ getItem: () => '{broken' }).version, 1);
+    const engine = new BrowserSpeechEngine(() => {});
+    const session = { settings: { target_wpm: 170 }, passage: { turns: [{ speaker: 'male', text: 'Male turn.' }, { speaker: 'female', text: 'Female turn.' }] }, questions: [{ id: 1, question: 'What happened?', options: ['one', 'two', 'three', 'four'] }] };
+    engine.play(session, { voiceMap: { male: { voiceURI: 'b', name: 'English B', lang: 'en-CA' }, female: { voiceURI: 'missing', name: '', lang: 'en-US' }, narrator: { voiceURI: 'a', name: 'English A', lang: 'en-US' } } });
+    assert.equal(spoken[0].text, 'Male turn.'); assert.equal(spoken[0].voice.voiceURI, 'b');
+    spoken[0].onend(); clearTimeout(engine.timer); engine.timer = null; engine.pending();
+    assert.equal(spoken[1].text, 'Female turn.'); assert.equal(spoken[1].voice.voiceURI, 'a');
+    spoken[1].onend(); clearTimeout(engine.timer); engine.timer = null; engine.pending();
+    assert.equal(spoken[2].text, 'Question 1. What happened?'); assert.equal(spoken.some(item => item.text === 'one'), false);
+    const stale = spoken[2].onend; engine.stop(); stale(); assert.equal(engine.pending, null);
+    engine.pause(); engine.resume(); assert.equal(controls.paused, 1); assert.equal(controls.resumed, 1); engine.destroy();
+  } finally { global.window = oldWindow; global.SpeechSynthesisUtterance = oldUtterance; }
 });

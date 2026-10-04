@@ -1,12 +1,13 @@
 <script setup>
 import { computed, onMounted, onBeforeUnmount, reactive, ref } from 'vue'
-import { BrowserSpeechEngine } from './speech.mjs'
+import { BrowserSpeechEngine, defaultVoicePreferences, loadVoicePreferences, saveVoicePreferences } from './speech.mjs'
 
 const state = ref('SETUP')
-const settings = reactive({ difficulty: 'CET-6', question_count: 3, target_wpm: 170, topic: '' })
+const settings = reactive({ difficulty: 'CET-6', question_count: 3, target_wpm: 170, topic: '', mode: 'monologue' })
 const presets = { 'CET-4': { wpm: 140, description: '基础词汇 · 直接理解' }, 'CET-6': { wpm: 170, description: '自然表达 · 适度推断' }, 'TEM-8': { wpm: 200, description: '信息密集 · 深层理解' } }
 const session = ref(null), result = ref(null), answers = reactive({})
 const error = ref(''), submitting = ref(false), supported = ref(false)
+const voices = ref([]), voicePreferences = reactive(loadVoicePreferences()), checkingVoices = ref(false)
 const audio = reactive({ paused: false, progress: 0, label: '准备播放' })
 const generation = reactive({ stage: 0, finishing: false })
 const generationStages = [
@@ -26,11 +27,22 @@ const reviewing = computed(() => ['SUBMITTED', 'REVIEW'].includes(state.value))
 const complete = computed(() => session.value && session.value.questions.every(q => Number.isInteger(answers[q.id])))
 const answered = computed(() => Object.keys(answers).length)
 const letters = ['A', 'B', 'C', 'D']
+function updateVoices(next = []) { voices.value = next.filter(voice => /^en[-_]/i.test(voice.lang || '')) }
+function chooseVoice(role, voiceURI) {
+  const voice = voices.value.find(item => item.voiceURI === voiceURI)
+  if (voice) { voicePreferences[role] = { voiceURI: voice.voiceURI || '', name: voice.name || '', lang: voice.lang || 'en-US' }; saveVoicePreferences(voicePreferences) }
+}
+function selectedVoiceValue(role) {
+  const preference = voicePreferences[role]
+  return voices.value.find(voice => (preference.voiceURI && voice.voiceURI === preference.voiceURI) || (preference.name && voice.name === preference.name && voice.lang === preference.lang))?.voiceURI || ''
+}
+function resetVoicePreferences() { Object.assign(voicePreferences, defaultVoicePreferences()); saveVoicePreferences(voicePreferences) }
+function previewVoice(role) { if (!engine) return; checkingVoices.value = true; engine.setVoiceMap(voicePreferences); engine.preview(role, message => { error.value = message }); setTimeout(() => { checkingVoices.value = false }, 500) }
 onMounted(() => {
   supported.value = 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window
-  if (supported.value) engine = new BrowserSpeechEngine(update => Object.assign(audio, update))
+  if (supported.value) { engine = new BrowserSpeechEngine(update => Object.assign(audio, update), updateVoices); updateVoices(engine.getVoices()) }
 })
-onBeforeUnmount(() => { engine?.stop(); controller?.abort(); stopGenerationFeedback() })
+onBeforeUnmount(() => { engine?.destroy(); controller?.abort(); stopGenerationFeedback() })
 function stopGenerationFeedback() {
   if (generationTimer) { clearInterval(generationTimer); generationTimer = undefined }
 }
@@ -76,7 +88,7 @@ function play() {
   error.value = ''
   const review = reviewing.value
   if (!review) state.value = 'PLAYING'
-  engine.play(session.value, () => { if (!review) state.value = 'ANSWERING' }, message => { error.value = message; if (!review) state.value = 'ANSWERING' })
+  engine.play(session.value, { voiceMap: voicePreferences, onDone: () => { if (!review) state.value = 'ANSWERING' }, onError: message => { error.value = message; if (!review) state.value = 'ANSWERING' } })
 }
 function togglePause() { audio.paused ? engine.resume() : engine.pause() }
 async function submit() {
@@ -106,6 +118,12 @@ async function submit() {
             <option v-for="(_, key) in presets" :key="key">{{ key }}</option>
           </select>
           <p class="muted">{{ presets[settings.difficulty].description }}</p>
+          <label for="listening-mode">材料模式</label>
+          <select id="listening-mode" v-model="settings.mode">
+            <option value="monologue">独白 · narrator</option>
+            <option value="dialogue">对话 · male / female</option>
+          </select>
+          <p class="muted">对话按原始发言顺序播放和复盘。</p>
           <label for="listening-count">题目数量</label>
           <select id="listening-count" v-model.number="settings.question_count">
             <option v-for="n in 4" :key="n" :value="n">{{ n }} 道题</option>
@@ -116,6 +134,20 @@ async function submit() {
           <label for="listening-speed">目标语速 <strong>{{ settings.target_wpm }} WPM</strong></label>
           <input id="listening-speed" v-model.number="settings.target_wpm" type="range" min="120" max="220" step="5">
           <div class="range-label"><span>120 · 从容</span><span>220 · 挑战</span></div>
+          <details class="voice-check">
+            <summary>校对音色</summary>
+            <div class="voice-heading"><label>播放音色</label><button type="button" class="text-button" @click="resetVoicePreferences">恢复默认</button></div>
+            <p v-if="!voices.length" class="muted">暂未发现英语音色，浏览器会在准备就绪后更新。</p>
+            <div v-for="role in ['narrator', 'male', 'female']" :key="role" class="voice-row">
+              <label :for="'voice-' + role">{{ role }}</label>
+              <select :id="'voice-' + role" :value="selectedVoiceValue(role)" @change="chooseVoice(role, $event.target.value)">
+                <option value="">自动选择英语音色</option>
+                <option v-for="voice in voices" :key="voice.voiceURI || voice.name" :value="voice.voiceURI">{{ voice.name }} · {{ voice.lang }}</option>
+              </select>
+              <button type="button" class="icon-button" :aria-label="'试听 ' + role + ' 音色'" @click="previewVoice(role)">▶</button>
+            </div>
+            <p class="muted">播放固定短句，音色由设备提供，仅供主观确认。</p>
+          </details>
         </fieldset>
         <p class="muted">浏览器语速为近似值。设置应用于下一轮练习。</p>
         <button class="primary" :disabled="generating || submitting || !supported" @click="generate">{{ generating ? '正在生成与校验…' : session ? '生成新练习' : '生成练习' }}</button>
@@ -168,13 +200,13 @@ async function submit() {
           <template v-else>
             <div class="panel result" aria-live="polite"><span class="eyebrow">本轮成绩</span><h2>{{ result.score }} <small>/ {{ result.total }}</small></h2><p>正确率 {{ Math.round(result.score / result.total * 100) }}%</p><button v-if="state === 'SUBMITTED'" class="secondary" @click="state = 'REVIEW'">查看原文与解析</button></div>
             <template v-if="state === 'REVIEW'">
-              <details class="panel transcript"><summary>查看完整原文</summary><p lang="en">{{ result.passage.text }}</p></details>
+              <details class="panel transcript"><summary>查看完整原文</summary><div v-for="(turn, index) in result.passage.turns" :key="index" class="transcript-turn"><span class="speaker">{{ turn.speaker }}</span><p lang="en">{{ turn.text }}</p></div></details>
               <article v-for="q in result.results" :key="q.id" class="panel review">
                 <h3>第 {{ q.id }} 题 · {{ q.correct ? '✓ 回答正确' : '回答错误' }}</h3>
                 <p lang="en">{{ q.question }}</p>
                 <p class="muted">你的答案：{{ letters[q.selected_answer] }} · 正确答案：{{ letters[q.correct_answer] }}</p>
                 <ol type="A"><li v-for="(option, i) in q.options" :key="i" :class="{ correct: i === q.correct_answer }" lang="en">{{ option }}</li></ol>
-                <blockquote lang="en">{{ q.evidence }}</blockquote><p>{{ q.explanation }}</p>
+                <blockquote lang="en"><p v-for="(evidence, index) in q.evidence" :key="index">{{ evidence.text }}</p></blockquote><p>{{ q.explanation }}</p>
               </article>
             </template>
           </template>
@@ -187,6 +219,7 @@ async function submit() {
 <style scoped>
 .setup input[type=text]{width:100%;padding:10px;border:1px solid var(--vp-c-divider);border-radius:8px;background:var(--vp-c-bg);font:inherit}
 .listening{max-width:1160px;margin:0 auto;padding:48px 24px 72px;color:var(--vp-c-text-1)}.hero{margin-bottom:32px}.eyebrow{font-size:12px;letter-spacing:2px;color:var(--vp-c-brand-1);font-weight:700}.hero h1{font-size:36px;font-weight:700;line-height:1.3;margin:12px 0}.hero p,.muted{color:var(--vp-c-text-2);font-size:14px;line-height:1.7}.workspace{display:grid;grid-template-columns:280px minmax(0,1fr);gap:24px;align-items:start}.panel{border:1px solid var(--vp-c-divider);background:var(--vp-c-bg-soft);border-radius:18px;padding:24px;margin-bottom:18px}.setup{position:sticky;top:88px}.panel h2{font-size:18px;font-weight:700;margin:0 0 16px}.setup label{display:block;margin:20px 0 8px;font-size:14px}.setup label strong{float:right}.setup select{width:100%;padding:10px;border:1px solid var(--vp-c-divider);border-radius:8px;background:var(--vp-c-bg);font:inherit}.setup input[type=range]{width:100%;accent-color:var(--vp-c-brand-1)}fieldset{border:0;padding:0;margin:0;min-width:0}.range-label{display:flex;justify-content:space-between;font-size:12px;color:var(--vp-c-text-2)}button{padding:10px 18px;border-radius:10px;font-weight:600;cursor:pointer;line-height:1.6}.primary{background:var(--vp-c-brand-1);color:var(--vp-c-white)}.secondary{border:1px solid var(--vp-c-divider);background:var(--vp-c-bg)}button:disabled{opacity:.45;cursor:not-allowed}.setup button{width:100%;margin-top:12px}.setup a{display:inline-block;font-size:14px;color:var(--vp-c-brand-1);margin-top:16px}.empty{text-align:center;min-height:360px;display:flex;flex-direction:column;align-items:center;justify-content:center}.headphones{font-size:64px;color:var(--vp-c-brand-1);margin-bottom:24px}.empty p{max-width:400px;color:var(--vp-c-text-2)}.generation-icon{height:52px;display:flex;align-items:flex-end;gap:7px;margin-bottom:24px}.generation-icon span{display:block;width:8px;height:22px;border-radius:6px;background:var(--vp-c-brand-1);animation:generation-bars 1.05s ease-in-out infinite}.generation-icon span:nth-child(2){height:36px;animation-delay:.16s}.generation-icon span:nth-child(3){height:28px;animation-delay:.32s}.generation-heading,.generation-progress,.generation-message{width:min(100%,440px)}.generation-heading{display:flex;align-items:baseline;justify-content:space-between;gap:16px}.generation-heading h2{margin-bottom:0}.generation-heading strong{font-variant-numeric:tabular-nums;color:var(--vp-c-brand-1)}.generation-progress{height:9px;margin:18px 0 14px;border-radius:999px;background:var(--vp-c-divider);overflow:hidden}.generation-progress span{display:block;height:100%;border-radius:inherit;background:var(--vp-c-brand-1);transition:width .7s ease;position:relative;overflow:hidden}.generation-progress span::after{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.55),transparent);animation:generation-shimmer 1.5s linear infinite}.generation-message{display:flex;justify-content:space-between;align-items:baseline;gap:20px;text-align:left;font-size:13px}.generation-message strong{color:var(--vp-c-text-1);white-space:nowrap}.generation-message span{color:var(--vp-c-text-2);text-align:right}.notice{padding:16px;background:var(--vp-c-danger-soft);border-radius:10px;margin-bottom:18px}.player-title{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}.player-title span{font-size:12px;color:var(--vp-c-text-2)}progress{width:100%;height:8px;accent-color:var(--vp-c-brand-1);margin:16px 0}.controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.question legend{font-weight:700;margin-bottom:14px}.option{display:flex;gap:12px;align-items:center;padding:14px;border:1px solid var(--vp-c-divider);border-radius:10px;margin:8px 0;background:var(--vp-c-bg);cursor:pointer}.option.selected{border-color:var(--vp-c-brand-1);background:var(--vp-c-brand-soft)}.option input{accent-color:var(--vp-c-brand-1)}.letter{font-weight:700;color:var(--vp-c-brand-1)}.submit{display:flex;align-items:center;justify-content:space-between}.result h2{font-size:56px;color:var(--vp-c-brand-1);margin:16px 0}.result small{font-size:24px;color:var(--vp-c-text-2)}.review h3{font-size:17px;font-weight:700}.review p,.transcript p{line-height:1.9;margin:16px 0;white-space:pre-wrap}.review ol{list-style:upper-alpha;padding-left:28px}.review li{padding:5px}.correct{color:var(--vp-c-brand-1);font-weight:650}.review blockquote{border-left:3px solid var(--vp-c-brand-1);padding:8px 16px;margin:16px 0;background:var(--vp-c-bg)}summary{cursor:pointer;font-weight:700}button:focus-visible,select:focus-visible,.option:focus-within{outline:2px solid var(--vp-c-brand-1);outline-offset:3px}@keyframes generation-bars{0%,100%{transform:scaleY(.55);opacity:.6}50%{transform:scaleY(1);opacity:1}}@keyframes generation-shimmer{from{transform:translateX(-100%)}to{transform:translateX(100%)}}@media(max-width:760px){.listening{padding:28px 16px}.workspace{grid-template-columns:1fr}.setup{position:static}.hero h1{font-size:28px}.panel{padding:18px}.generation-message{align-items:flex-start;flex-direction:column;gap:4px}.generation-message span{text-align:left}}
+.voice-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}.voice-heading label{flex:0 0 auto;margin:0;white-space:nowrap}.text-button{width:auto!important;flex:0 0 auto;padding:0;border:0;background:transparent;color:var(--vp-c-brand-1);font-size:12px;line-height:1.4;white-space:nowrap}.voice-row{display:grid;grid-template-columns:58px minmax(0,1fr) 34px;gap:6px;align-items:center;margin:8px 0}.voice-row label{margin:0;font-size:12px;color:var(--vp-c-text-2)}.voice-row select{min-width:0;padding:7px;font-size:12px}.icon-button{padding:5px;border:1px solid var(--vp-c-divider);background:var(--vp-c-bg);font-size:12px}.voice-check{margin-top:14px;border-top:1px solid var(--vp-c-divider);padding-top:12px}.voice-check button{padding:6px 8px;margin:4px 4px 0 0;font-size:12px}.speaker{display:inline-block;min-width:68px;font-size:12px;font-weight:700;letter-spacing:.5px;color:var(--vp-c-brand-1);text-transform:uppercase}.transcript-turn{display:flex;gap:12px;align-items:flex-start}.transcript-turn p{flex:1;margin-top:0}
 /* The server does not expose granular progress, so this stays intentionally indeterminate. */
 .generation-live{font-size:12px;color:var(--vp-c-text-2)}.generation-progress span{width:36%;transition:none;animation:generation-sweep 1.8s ease-in-out infinite}.generation-progress.finishing span{width:100%;animation:none;transition:width .32s ease}.generation-progress.finishing span::after{animation:none;opacity:0}@keyframes generation-sweep{0%{transform:translateX(-120%)}50%{transform:translateX(180%)}100%{transform:translateX(280%)}}
 </style>

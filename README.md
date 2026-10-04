@@ -42,3 +42,5 @@ The tests inject a fake model provider and do not use API credits. Browser tests
 - `PORT`: optional production/API port; defaults to `3001`.
 
 The generation API accepts optional `topic` (up to 120 characters). When omitted or blank, the model chooses a topic at random. Practice sessions are stored in memory and expire after one hour; restarting the server clears them.
+
+Listening sessions use schema v2. Set `mode` to `monologue` (the default, one `narrator` turn) or `dialogue` (ordered `male` and `female` turns). The browser keeps the passage hidden until submission and maps each logical role to a locally selected English Speech Synthesis voice.
