@@ -142,8 +142,7 @@ async function generate(settings, provider, options = {}) {
   const notify = (event) => {
     if (typeof options.onProgress !== 'function') return;
     const elapsedMs = Date.now() - started;
-    const etaMs = completedSteps > 0 ? Math.max(0, Math.round((elapsedMs / completedSteps) * (totalSteps - completedSteps))) : null;
-    try { options.onProgress({ ...event, completedSteps, totalSteps, elapsedMs, etaMs }); } catch {}
+    try { options.onProgress({ ...event, completedSteps, totalSteps, elapsedMs }); } catch {}
   };
   const ensureBudget = () => {
     if (options.signal?.aborted) { const error = Error('生成已取消。'); error.name = 'AbortError'; throw error; }
