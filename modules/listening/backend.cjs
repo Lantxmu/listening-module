@@ -150,13 +150,27 @@ async function generate(settings, provider, options = {}) {
   };
   let passage, passageFeedback = '';
   const passageAttempts = options.passageAttempts || 3;
+  const { min: minPassageWords, max: maxPassageWords } = targetWordRange(settings);
+  const targetPassageWords = 70 + settings.question_count * 50;
   for (let attempt = 0; attempt < passageAttempts; attempt++) {
     try {
       ensureBudget();
       notify({ stage: 'passage', status: 'running', detail: '正在生成听力材料。', attempt: attempt + 1 });
       const modeInstruction = settings.mode === 'dialogue' ? 'Return 4-24 alternating dialogue turns using only speakers male and female. Each speaker must appear at least twice, no speaker may appear three times in a row, and each speaker must contribute at least 30% of the words.' : 'Return exactly one turn using speaker narrator.';
-      const raw = await provider.complete('Generate a fresh coherent English listening passage. ' + modeInstruction + ' Do not put Man:, Woman:, Male:, or Female: prefixes in turn text. Return JSON {"turns":[{"speaker":"narrator|male|female","text":"..."}]}. If retry_feedback is present, fix that specific problem.', JSON.stringify({ mode: settings.mode, difficulty: PRESETS[settings.difficulty], target_words: 70 + settings.question_count * 50, topic_preference: settings.topic, genre: 'Choose narrative, interview, report, conversation, or mini lecture.', retry_feedback: passageFeedback }), { signal: options.signal });
-      const generated = validateTurns(raw.turns, settings.mode, settings); passage = { text: generated.text, turns: generated.turns };
+      const raw = await provider.complete('Generate a fresh coherent English listening passage. ' + modeInstruction + ' The total across all turn texts must be between ' + minPassageWords + ' and ' + maxPassageWords + ' English words; aim for ' + targetPassageWords + '. Do not put Man:, Woman:, Male:, or Female: prefixes in turn text. Return JSON {"turns":[{"speaker":"narrator|male|female","text":"..."}]}. If retry_feedback is present, fix that specific problem.', JSON.stringify({ mode: settings.mode, difficulty: PRESETS[settings.difficulty], target_words: targetPassageWords, acceptable_word_range: { min: minPassageWords, max: maxPassageWords }, topic_preference: settings.topic, genre: 'Choose narrative, interview, report, conversation, or mini lecture.', retry_feedback: passageFeedback }), { signal: options.signal });
+      let generated;
+      try {
+        generated = validateTurns(raw.turns, settings.mode, settings);
+      } catch (error) {
+        if (error.message !== '文章词数不符合练习目标。') throw error;
+        const actualWords = wordCount(raw.turns.map(turn => turn.text).join(' '));
+        const adjustment = actualWords < minPassageWords ? 'lengthen' : 'shorten';
+        ensureBudget();
+        notify({ stage: 'passage', status: 'running', detail: adjustment === 'lengthen' ? '文章偏短，正在自动扩写。' : '文章偏长，正在自动精简。', attempt: attempt + 1 });
+        const revised = await provider.complete('Revise the supplied English listening passage instead of writing a new one. Its current total is ' + actualWords + ' words, outside the required range of ' + minPassageWords + '-' + maxPassageWords + '. ' + (adjustment === 'lengthen' ? 'Lengthen it naturally with relevant details.' : 'Shorten it while preserving the important information.') + ' The total across all turn texts must be within that range; aim for ' + targetPassageWords + ' words. Preserve the topic, meaning, difficulty, turn order, and speakers. ' + modeInstruction + ' Do not add speaker prefixes. Return JSON {"turns":[{"speaker":"narrator|male|female","text":"..."}]}.', JSON.stringify({ mode: settings.mode, difficulty: PRESETS[settings.difficulty], target_words: targetPassageWords, acceptable_word_range: { min: minPassageWords, max: maxPassageWords }, current_word_count: actualWords, adjustment, turns: raw.turns }), { signal: options.signal });
+        generated = validateTurns(revised.turns, settings.mode, settings);
+      }
+      passage = { text: generated.text, turns: generated.turns };
       if (settings.topic) { ensureBudget(); notify({ stage: 'passage_audit', status: 'running', detail: '正在审核文章主题和难度。', attempt: attempt + 1 }); const verdict = validateAuditResult(await provider.complete('Audit whether the passage clearly centers the requested topic, is coherent, and matches the requested difficulty. Return JSON {"valid":true/false,"reason":"..."}.', JSON.stringify({ mode: settings.mode, difficulty: PRESETS[settings.difficulty], topic: settings.topic, passage }), { signal: options.signal })); if (!verdict.valid) throw Error('文章主题或难度审核未通过：' + (verdict.reason.trim().slice(0, 1000) || '审核模型未提供原因。')); }
       completedSteps++;
       notify({ stage: 'passage', status: 'complete', detail: '听力材料已准备好。' });
