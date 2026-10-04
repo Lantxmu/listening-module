@@ -97,6 +97,14 @@ function validateQuestion(q, passage, id) {
 
 function validateAuditResult(value) { rejectUnknown(value, ['valid', 'reason'], '审核结果'); if (!value || typeof value.valid !== 'boolean' || typeof value.reason !== 'string') throw Error('模型审核结果无效。'); return value; }
 
+function parseModelContent(content) {
+  if (content && typeof content === 'object' && !Array.isArray(content)) return content;
+  if (Array.isArray(content)) content = content.map(part => typeof part === 'string' ? part : part?.type === 'text' ? part.text : '').join('');
+  if (typeof content !== 'string') throw Error('模型返回无效 JSON。');
+  const value = content.trim(), fenced = value.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  try { return JSON.parse(fenced ? fenced[1] : value); } catch { throw Error('模型返回无效 JSON。'); }
+}
+
 function validateSession(session) {
   rejectUnknown(session, ['schema_version', 'id', 'settings', 'passage', 'questions'], '会话');
   if (!session || session.schema_version !== 2 || typeof session.id !== 'string') throw Error('会话结构无效。');
@@ -110,9 +118,11 @@ function validateSession(session) {
 
 class CompatibleGenerator {
   constructor() { this.key = process.env.LISTENING_API_KEY; this.url = chatCompletionsUrl(process.env.LISTENING_API_URL); this.model = process.env.LISTENING_MODEL || 'deepseek-chat'; }
-  async complete(system, user) {
+  async complete(system, user, options = {}) {
     if (!this.key) throw Error('请在服务端配置 LISTENING_API_KEY 并重启。');
-    const r = await fetch(this.url, { method: 'POST', signal: AbortSignal.timeout(60000), headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + this.key }, body: JSON.stringify({ model: this.model, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], temperature: 0.6, max_tokens: 4000, response_format: { type: 'json_object' } }) });
+    const timeoutSignal = AbortSignal.timeout(60000);
+    const signal = options.signal ? AbortSignal.any([timeoutSignal, options.signal]) : timeoutSignal;
+    const r = await fetch(this.url, { method: 'POST', signal, headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + this.key }, body: JSON.stringify({ model: this.model, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], temperature: 0.6, max_tokens: 4000, response_format: { type: 'json_object' } }) });
     const body = await r.text();
     if (!r.ok) {
       let detail = '';
@@ -121,23 +131,38 @@ class CompatibleGenerator {
       throw Error('模型服务请求失败（' + r.status + '）' + (detail ? '：' + detail : '。') + ' 请求地址：' + this.url);
     }
     let data; try { data = JSON.parse(body); } catch { throw Error('模型服务返回了非 JSON 响应，请检查 LISTENING_API_URL。'); }
-    try { return JSON.parse(data.choices[0].message.content); } catch { throw Error('模型返回无效 JSON。'); }
+    return parseModelContent(data?.choices?.[0]?.message?.content);
   }
 }
 
 async function generate(settings, provider, options = {}) {
   const started = Date.now(), budget = options.budgetMs || 180000;
-  const ensureBudget = () => { if (Date.now() - started >= budget) throw Error('生成时间过长，请重试。'); };
-  let passage;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const totalSteps = settings.question_count + 1;
+  let completedSteps = 0;
+  const notify = (event) => {
+    if (typeof options.onProgress !== 'function') return;
+    const elapsedMs = Date.now() - started;
+    const etaMs = completedSteps > 0 ? Math.max(0, Math.round((elapsedMs / completedSteps) * (totalSteps - completedSteps))) : null;
+    try { options.onProgress({ ...event, completedSteps, totalSteps, elapsedMs, etaMs }); } catch {}
+  };
+  const ensureBudget = () => {
+    if (options.signal?.aborted) { const error = Error('生成已取消。'); error.name = 'AbortError'; throw error; }
+    if (Date.now() - started >= budget) throw Error('生成时间过长，请重试。');
+  };
+  let passage, passageFeedback = '';
+  const passageAttempts = options.passageAttempts || 3;
+  for (let attempt = 0; attempt < passageAttempts; attempt++) {
     try {
       ensureBudget();
+      notify({ stage: 'passage', status: 'running', detail: '正在生成听力材料。', attempt: attempt + 1 });
       const modeInstruction = settings.mode === 'dialogue' ? 'Return 4-24 alternating dialogue turns using only speakers male and female. Each speaker must appear at least twice, no speaker may appear three times in a row, and each speaker must contribute at least 30% of the words.' : 'Return exactly one turn using speaker narrator.';
-      const raw = await provider.complete('Generate a fresh coherent English listening passage. ' + modeInstruction + ' Do not put Man:, Woman:, Male:, or Female: prefixes in turn text. Return JSON {"turns":[{"speaker":"narrator|male|female","text":"..."}]}.', JSON.stringify({ mode: settings.mode, difficulty: PRESETS[settings.difficulty], target_words: 70 + settings.question_count * 50, topic_preference: settings.topic, genre: 'Choose narrative, interview, report, conversation, or mini lecture.' }));
+      const raw = await provider.complete('Generate a fresh coherent English listening passage. ' + modeInstruction + ' Do not put Man:, Woman:, Male:, or Female: prefixes in turn text. Return JSON {"turns":[{"speaker":"narrator|male|female","text":"..."}]}. If retry_feedback is present, fix that specific problem.', JSON.stringify({ mode: settings.mode, difficulty: PRESETS[settings.difficulty], target_words: 70 + settings.question_count * 50, topic_preference: settings.topic, genre: 'Choose narrative, interview, report, conversation, or mini lecture.', retry_feedback: passageFeedback }), { signal: options.signal });
       const generated = validateTurns(raw.turns, settings.mode, settings); passage = { text: generated.text, turns: generated.turns };
-      if (settings.topic) { ensureBudget(); const verdict = validateAuditResult(await provider.complete('Audit whether the passage clearly centers the requested topic, is coherent, and matches the requested difficulty. Return JSON {"valid":true/false,"reason":"..."}.', JSON.stringify({ mode: settings.mode, difficulty: PRESETS[settings.difficulty], topic: settings.topic, passage }))); if (!verdict.valid) throw Error('文章主题或难度审核未通过。'); }
+      if (settings.topic) { ensureBudget(); notify({ stage: 'passage_audit', status: 'running', detail: '正在审核文章主题和难度。', attempt: attempt + 1 }); const verdict = validateAuditResult(await provider.complete('Audit whether the passage clearly centers the requested topic, is coherent, and matches the requested difficulty. Return JSON {"valid":true/false,"reason":"..."}.', JSON.stringify({ mode: settings.mode, difficulty: PRESETS[settings.difficulty], topic: settings.topic, passage }), { signal: options.signal })); if (!verdict.valid) throw Error('文章主题或难度审核未通过：' + (verdict.reason.trim().slice(0, 1000) || '审核模型未提供原因。')); }
+      completedSteps++;
+      notify({ stage: 'passage', status: 'complete', detail: '听力材料已准备好。' });
       break;
-    } catch (error) { if (attempt === 1) throw error; }
+    } catch (error) { if (error.name === 'AbortError') throw error; passageFeedback = String(error.message || error).slice(0, 1000); notify({ stage: 'retry', status: 'retrying', detail: '文章未通过校验，正在重试。', attempt: attempt + 1 }); if (attempt === passageAttempts - 1) throw error; }
   }
   const questions = [], questionPassage = { settings, passage };
   for (let id = 1; id <= settings.question_count; id++) {
@@ -145,14 +170,16 @@ async function generate(settings, provider, options = {}) {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         ensureBudget();
-        const raw = await provider.complete('Generate ONE English comprehension question strictly based on the passage and its ordered turns. JSON {type,question,options:[four strings],correct_answer:0..3,evidence:[{"text":"exact quote","speaker":"narrator|male|female","turn":0}],explanation}. Types: detail,inference,main_idea,speaker_attitude,purpose. Exactly one defensible answer. Evidence must be one or more exact continuous quotes from the specified turns. If a question involves a speaker, explicitly write male or female. Distinct plausible distractors of similar length; no wording clues, obscure trivia or common knowledge shortcuts. Vary question types. Explanation may be Chinese.', JSON.stringify({ mode: settings.mode, passage, difficulty: PRESETS[settings.difficulty], previous_questions: questions.map(q => ({ question: q.question, type: q.type })), feedback }));
+        notify({ stage: 'question_generate', status: 'running', detail: '正在生成第 ' + id + ' / ' + settings.question_count + ' 道题。', question: id, totalQuestions: settings.question_count, attempt: attempt + 1 });
+        const raw = await provider.complete('Generate ONE English comprehension question strictly based on the passage and its ordered turns. JSON {type,question,options:[four strings],correct_answer:0..3,evidence:[{"text":"exact quote","speaker":"narrator|male|female","turn":0}],explanation}. Types: detail,inference,main_idea,speaker_attitude,purpose. Exactly one defensible answer. Evidence must be one or more exact continuous quotes from the specified turns. If a question involves a speaker, explicitly write male or female. Distinct plausible distractors of similar length; no wording clues, obscure trivia or common knowledge shortcuts. Vary question types. Explanation may be Chinese. If feedback is present, fix that specific problem.', JSON.stringify({ mode: settings.mode, passage, difficulty: PRESETS[settings.difficulty], previous_questions: questions.map(q => ({ question: q.question, type: q.type })), feedback: feedback.slice(0, 1000) }), { signal: options.signal });
         const q = validateQuestion(raw, questionPassage, id); if (questions.some(old => old.question.toLowerCase() === q.question.toLowerCase())) throw Error('题干重复。');
-        ensureBudget(); const verdict = validateAuditResult(await provider.complete('Independently audit the question based ONLY on the ordered passage turns: exactly one defensible answer, correct index, supporting evidence, plausible distinct distractors, no grammar/length clues, no trivia or common knowledge shortcuts. Reject ambiguity. Return JSON {"valid":true/false,"reason":"..."}.', JSON.stringify({ mode: settings.mode, passage, question: q }))); if (verdict.valid !== true) throw Error(verdict.reason.slice(0, 1000) || '语义校验失败。');
-        questions.push(q); break;
-      } catch (error) { feedback = error.message; if (attempt === 2) throw Error('第 ' + id + ' 题生成或校验失败，请重试。'); }
+        ensureBudget(); notify({ stage: 'question_audit', status: 'running', detail: '正在审核第 ' + id + ' / ' + settings.question_count + ' 道题。', question: id, totalQuestions: settings.question_count, attempt: attempt + 1 }); const verdict = validateAuditResult(await provider.complete('Independently audit the question based ONLY on the ordered passage turns: exactly one defensible answer, correct index, supporting evidence, plausible distinct distractors, no grammar/length clues, no trivia or common knowledge shortcuts. Reject ambiguity. Return JSON {"valid":true/false,"reason":"..."}.', JSON.stringify({ mode: settings.mode, passage, question: q }), { signal: options.signal })); if (verdict.valid !== true) throw Error(verdict.reason.slice(0, 1000) || '语义校验失败。');
+        questions.push(q); completedSteps++; notify({ stage: 'question_audit', status: 'complete', detail: '第 ' + id + ' / ' + settings.question_count + ' 道题已校验。', question: id, totalQuestions: settings.question_count }); break;
+      } catch (error) { if (error.name === 'AbortError') throw error; feedback = String(error.message || error).slice(0, 1000); notify({ stage: 'retry', status: 'retrying', detail: '第 ' + id + ' 题未通过校验，正在重试。', question: id, totalQuestions: settings.question_count, attempt: attempt + 1 }); if (attempt === 2) throw Error('第 ' + id + ' 题生成或校验失败，请重试。'); }
     }
   }
-  const session = { schema_version: 2, id: randomUUID(), settings, passage, questions }; validateSession(session); return session;
+  notify({ stage: 'finalizing', status: 'running', detail: '正在整理练习。' });
+  const session = { schema_version: 2, id: randomUUID(), settings, passage, questions }; validateSession(session); notify({ stage: 'finalizing', status: 'complete', detail: '练习已经准备好。' }); return session;
 }
 
 function publicSession(session) { return { schema_version: 2, id: session.id, settings: session.settings, passage: session.passage, questions: session.questions.map(({ id, question, options, type }) => ({ id, type, question, options })) }; }
@@ -166,11 +193,27 @@ function score(session, answers) {
 function createPracticeRouter({ provider = new CompatibleGenerator(), ttl = 3600000, capacity = 100, generationBudgetMs = 180000 } = {}) {
   const router = express.Router(), sessions = new Map(); let generating = 0;
   function prune() { for (const [id, entry] of sessions) if (entry.expires <= Date.now()) sessions.delete(id); }
+  function saveSession(session) { prune(); while (sessions.size >= capacity) sessions.delete(sessions.keys().next().value); sessions.set(session.id, { session, expires: Date.now() + ttl, result: null }); return publicSession(session); }
   router.use((req, res, next) => { res.set('Cache-Control', 'no-store'); prune(); next(); });
+  router.post('/generate/stream', async (req, res) => {
+    let settings; try { settings = settingsOf(req.body); } catch (error) { return res.status(400).json({ error: error.message }); }
+    if (generating >= 2) return res.status(429).json({ error: '生成任务较多，请稍后重试。' }); generating++;
+    const abortController = new AbortController(); let closed = false;
+    const send = (event) => { if (!closed && !res.writableEnded) res.write('event: ' + event.type + '\ndata: ' + JSON.stringify(event) + '\n\n'); };
+    res.status(200).set({ 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive' }); res.flushHeaders?.();
+    const heartbeat = setInterval(() => { if (!closed && !res.writableEnded) res.write(': keep-alive\n\n'); }, 15000);
+    res.on('close', () => { closed = true; abortController.abort(); clearInterval(heartbeat); });
+    try {
+      const session = await generate(settings, provider, { budgetMs: generationBudgetMs, signal: abortController.signal, onProgress: event => send({ type: 'progress', ...event }) });
+      if (!closed) { send({ type: 'complete', session: saveSession(session) }); res.end(); }
+    } catch (error) {
+      if (!closed) { send({ type: 'error', error: error.name === 'TimeoutError' ? '模型请求超时，请重试。' : error.message }); res.end(); }
+    } finally { clearInterval(heartbeat); generating--; }
+  });
   router.post('/generate', async (req, res) => {
     let settings; try { settings = settingsOf(req.body); } catch (error) { return res.status(400).json({ error: error.message }); }
     if (generating >= 2) return res.status(429).json({ error: '生成任务较多，请稍后重试。' }); generating++;
-    try { const session = await generate(settings, provider, { budgetMs: generationBudgetMs }); prune(); while (sessions.size >= capacity) sessions.delete(sessions.keys().next().value); sessions.set(session.id, { session, expires: Date.now() + ttl, result: null }); res.json(publicSession(session)); }
+    try { const session = await generate(settings, provider, { budgetMs: generationBudgetMs }); res.json(saveSession(session)); }
     catch (error) { res.status(502).json({ error: error.name === 'TimeoutError' ? '模型请求超时，请重试。' : error.message }); }
     finally { generating--; }
   });
@@ -179,4 +222,4 @@ function createPracticeRouter({ provider = new CompatibleGenerator(), ttl = 3600
   return router;
 }
 
-module.exports = { PRESETS, settingsOf, wordCount, targetWordRange, validateTurns, validateQuestion, validateAuditResult, validateSession, generate, publicSession, score, createPracticeRouter, chatCompletionsUrl };
+module.exports = { PRESETS, settingsOf, wordCount, targetWordRange, validateTurns, validateQuestion, validateAuditResult, validateSession, generate, publicSession, score, createPracticeRouter, chatCompletionsUrl, parseModelContent };

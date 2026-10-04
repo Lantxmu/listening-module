@@ -2,7 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const express = require('express');
-const { settingsOf, validateTurns, validateQuestion, generate, publicSession, score, createPracticeRouter, chatCompletionsUrl } = require('./backend.cjs');
+const { settingsOf, validateTurns, validateQuestion, generate, publicSession, score, createPracticeRouter, chatCompletionsUrl, parseModelContent } = require('./backend.cjs');
 
 const settings = { difficulty: 'CET-6', question_count: 1, target_wpm: 170, topic: '', mode: 'monologue' };
 const passageText = 'The research team moved the workshop to Friday because the laboratory was closed on Thursday. Maya used the extra time to revise the safety checklist and invite two visiting students. Although the delay was inconvenient, the final demonstration was clearer and better organized than the original plan. The team also compared the results with last year’s measurements, discussed several safety questions, and recorded practical advice for students who would repeat the experiment during the summer program. Before leaving, the members labeled every sample, backed up their notes, and agreed to meet again next month to evaluate the long term effects of the revised procedure.';
@@ -32,6 +32,12 @@ test('accepts provider URLs and normalizes the default mode', () => {
   assert.equal(settingsOf({ ...settings, mode: undefined }).mode, 'monologue');
   assert.throws(() => settingsOf({ ...settings, mode: 'stereo' }));
   assert.throws(() => settingsOf({ ...settings, extra: true }));
+});
+
+test('accepts common JSON content encodings from compatible model APIs', () => {
+  assert.deepEqual(parseModelContent('{"valid":true}'), { valid: true });
+  assert.deepEqual(parseModelContent('```json\n{"valid":true}\n```'), { valid: true });
+  assert.deepEqual(parseModelContent([{ type: 'text', text: '{"valid":true}' }]), { valid: true });
 });
 
 test('validates v2 turns, word ranges, roles and dialogue balance', () => {
@@ -77,6 +83,26 @@ test('question retries are capped and passage is not regenerated', async () => {
   assert.equal(passages, 1); assert.equal(attempts, 3);
 });
 
+test('passage retries include validation feedback and allow two retries', async () => {
+  let passages = 0, audits = 0, retryFeedback = [];
+  const session = await generate({ ...settings, topic: 'laboratory planning' }, { async complete(system, user) {
+    if (system.startsWith('Generate a fresh')) {
+      passages++;
+      retryFeedback.push(JSON.parse(user).retry_feedback);
+      return { turns: passage.turns };
+    }
+    if (system.startsWith('Audit whether')) {
+      audits++;
+      return audits < 3 ? { valid: false, reason: '主题不够明确' } : { valid: true, reason: '' };
+    }
+    if (system.startsWith('Independently')) return { valid: true, reason: '' };
+    return question;
+  }});
+  assert.equal(passages, 3); assert.equal(audits, 3); assert.equal(retryFeedback[0], '');
+  assert.match(retryFeedback[1], /主题不够明确/); assert.match(retryFeedback[2], /主题不够明确/);
+  assert.equal(session.schema_version, 2);
+});
+
 test('schema is strict and HTTP keeps solutions hidden until the locked submission', async () => {
   const schema = JSON.parse(fs.readFileSync(require('node:path').join(__dirname, 'practice-session.schema.json')));
   assert.equal(schema.properties.schema_version.const, 2); assert.equal(schema.additionalProperties, false);
@@ -92,6 +118,26 @@ test('schema is strict and HTTP keeps solutions hidden until the locked submissi
     const result = await (await post('/' + session.id + '/submit', { answers: { [session.questions[0].id]: 3 } })).json();
     assert.equal(result.score, 1); assert.equal(result.results[0].evidence[0].speaker, 'narrator');
     await new Promise(resolve => setTimeout(resolve, 220)); assert.equal((await fetch(base + '/' + session.id)).status, 404);
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
+test('stream generation reports real workflow progress and returns the public session', async () => {
+  const app = express(); app.use(express.json()); app.use('/api/practice', createPracticeRouter({ provider: provider() }));
+  const server = app.listen(0, '127.0.0.1'); await new Promise(resolve => server.once('listening', resolve));
+  const base = 'http://127.0.0.1:' + server.address().port + '/api/practice';
+  try {
+    const response = await fetch(base + '/generate/stream', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' }, body: JSON.stringify(settings) });
+    const body = await response.text();
+    const events = body.split(/\r?\n\r?\n/).filter(block => block.includes('event:')).map(block => {
+      const event = block.match(/event:\s*([^\r\n]+)/)?.[1];
+      const data = block.match(/data:\s*([^\r\n]+)/)?.[1];
+      return { event, data: data ? JSON.parse(data) : null };
+    });
+    const progress = events.filter(item => item.event === 'progress');
+    assert.equal(response.status, 200); assert.match(response.headers.get('content-type'), /text\/event-stream/);
+    assert.equal(progress[0].data.stage, 'passage'); assert.ok(progress.some(item => item.data.stage === 'question_generate')); assert.ok(progress.some(item => item.data.stage === 'question_audit'));
+    assert.equal(progress.at(-1).data.completedSteps, progress.at(-1).data.totalSteps);
+    assert.equal(events.at(-1).event, 'complete'); assert.equal(events.at(-1).data.session.questions[0].correct_answer, undefined);
   } finally { await new Promise(resolve => server.close(resolve)); }
 });
 

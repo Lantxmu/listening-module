@@ -61,7 +61,7 @@ const { createPracticeRouter } = require('./backend.cjs');
     await page.locator('.question').first().waitFor();
     assert.equal(await page.locator('.review').count(),0);
     assert.equal(await page.locator('.question input:checked').count(),0);
-    await page.route('**/api/practice/generate',route=>route.fulfill({status:502,contentType:'application/json',body:JSON.stringify({error:'模拟生成失败，请重试。'})}));
+    await page.route('**/api/practice/generate/stream',route=>route.fulfill({status:502,contentType:'application/json',body:JSON.stringify({error:'模拟生成失败，请重试。'})}));
     await page.getByRole('button',{name:'生成新练习',exact:true}).click();
     await page.getByRole('alert').filter({hasText:'模拟生成失败'}).waitFor();
     assert.equal(await page.getByRole('button',{name:'生成练习',exact:true}).isEnabled(),true);
