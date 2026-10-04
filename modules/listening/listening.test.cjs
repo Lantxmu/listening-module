@@ -177,3 +177,21 @@ test('speech maps ordered turns, falls back safely, and ignores stale callbacks'
     engine.pause(); engine.resume(); assert.equal(controls.paused, 1); assert.equal(controls.resumed, 1); engine.destroy();
   } finally { global.window = oldWindow; global.SpeechSynthesisUtterance = oldUtterance; }
 });
+
+test('speech progress advances within a long utterance and reaches 100%', async () => {
+  const { BrowserSpeechEngine } = await import('../../docs/.vitepress/theme/components/listening/speech.mjs');
+  const oldWindow = global.window, oldUtterance = global.SpeechSynthesisUtterance;
+  const updates = [], spoken = [];
+  global.window = { speechSynthesis: { getVoices: () => [{ voiceURI: 'a', name: 'English A', lang: 'en-US' }], speak: utterance => spoken.push(utterance), cancel() {}, pause() {}, resume() {}, addEventListener() {}, removeEventListener() {} } };
+  global.SpeechSynthesisUtterance = class { constructor(text) { this.text = text; } };
+  try {
+    const engine = new BrowserSpeechEngine(update => updates.push(update));
+    const session = { settings: { target_wpm: 170 }, passage: { turns: [{ speaker: 'narrator', text: 'One two three four five six seven eight nine ten.' }] }, questions: [] };
+    engine.play(session);
+    await new Promise(resolve => setTimeout(resolve, 120));
+    assert.ok(updates.some(update => update.progress > 0), 'progress should move before speech ends');
+    spoken[0].onend();
+    assert.equal(updates.at(-1).progress, 100);
+    engine.destroy();
+  } finally { global.window = oldWindow; global.SpeechSynthesisUtterance = oldUtterance; }
+});
