@@ -37,7 +37,7 @@ The tests inject a fake model provider and do not use API credits. Browser tests
 ## Configuration
 
 - `LISTENING_API_KEY`: required model API key.
-- `LISTENING_API_URL`: optional OpenAI-compatible chat completions URL; defaults to DeepSeek.
+- `LISTENING_API_URL`: optional OpenAI-compatible provider base URL; the server appends `/v1/chat/completions` (a full endpoint URL is also accepted). Defaults to DeepSeek.
 - `LISTENING_MODEL`: optional model name; defaults to `deepseek-chat`.
 - `PORT`: optional production/API port; defaults to `3001`.
 

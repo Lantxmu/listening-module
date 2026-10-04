@@ -1,11 +1,16 @@
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const express=require('express');
-const {settingsOf,validateQuestion,generate,publicSession,score,createPracticeRouter}=require('./backend.cjs');
+const {settingsOf,validateQuestion,generate,publicSession,score,createPracticeRouter,chatCompletionsUrl}=require('./backend.cjs');
 const passage='Maya moved the workshop to Friday because the laboratory was closed on Thursday.';
 const question={type:'detail',question:'Why was the workshop moved?',options:['The laboratory was closed.','The teacher was travelling.','More students could attend.','The equipment had arrived.'],correct_answer:0,evidence:'the laboratory was closed on Thursday',explanation:'实验室周四关闭，因此改到周五。'};
 const settings={difficulty:'CET-6',question_count:1,target_wpm:170};
 function provider(){return {async complete(system){if(system.startsWith('Generate a fresh'))return {text:passage};if(system.startsWith('Independently'))return {valid:true};return {...question};}};}
+test('accepts provider base URLs and complete endpoint URLs',()=>{
+  assert.equal(chatCompletionsUrl('https://sub2api.example').toString(),'https://sub2api.example/v1/chat/completions');
+  assert.equal(chatCompletionsUrl('https://sub2api.example/v1').toString(),'https://sub2api.example/v1/chat/completions');
+  assert.equal(chatCompletionsUrl('https://sub2api.example/v1/chat/completions').toString(),'https://sub2api.example/v1/chat/completions');
+});
 test('reject invalid settings and malformed or unsupported questions',()=>{
   for(const s of [{...settings,question_count:0},{...settings,question_count:5},{...settings,target_wpm:221},{...settings,difficulty:'__proto__'}])assert.throws(()=>settingsOf(s));
   for(const q of [{...question,options:['one']},{...question,options:['Same','same!','x','y']},{...question,correct_answer:4},{...question,correct_answer:'0'},{...question,evidence:'Invented quote'},{...question,question:''}])assert.throws(()=>validateQuestion(q,passage,1));

@@ -2,6 +2,14 @@ const express = require('express');
 const { randomUUID } = require('node:crypto');
 const PRESETS = {'CET-4':'Moderate vocabulary, short syntax, direct questions.', 'CET-6':'Natural academic English, longer syntax, moderate inference.', 'TEM-8':'Advanced vocabulary, dense information, subtle inference and distractors.'};
 const TYPES = ['detail','inference','main_idea','speaker_attitude','purpose'];
+function chatCompletionsUrl(value) {
+  const url = new URL((value || 'https://api.deepseek.com/v1/chat/completions').trim());
+  const pathname = url.pathname.replace(/\/+$/, '');
+  if (pathname.endsWith('/chat/completions')) url.pathname = pathname;
+  else if (pathname.endsWith('/v1')) url.pathname = pathname + '/chat/completions';
+  else url.pathname = pathname + '/v1/chat/completions';
+  return url;
+}
 function settingsOf(s) {
   if (!s || !Object.hasOwn(PRESETS,s.difficulty) || !Number.isInteger(s.question_count) || s.question_count<1 || s.question_count>4 || !Number.isInteger(s.target_wpm) || s.target_wpm<120 || s.target_wpm>220) throw Error('请选择有效难度、1–4 道题和 120–220 WPM。');
   if (s.topic !== undefined && (typeof s.topic !== 'string' || s.topic.length > 120)) throw Error('偏好主题最多 120 个字符。');
@@ -19,12 +27,19 @@ function validateQuestion(q,passage,id) {
   return {id,type:q.type,question:text(q.question,'题干',600),options,correct_answer:q.correct_answer,evidence,explanation:text(q.explanation,'解析',3000)};
 }
 class CompatibleGenerator {
-  constructor(){this.key=process.env.LISTENING_API_KEY;this.url=process.env.LISTENING_API_URL||'https://api.deepseek.com/v1/chat/completions';this.model=process.env.LISTENING_MODEL||'deepseek-chat';}
+  constructor(){this.key=process.env.LISTENING_API_KEY;this.url=chatCompletionsUrl(process.env.LISTENING_API_URL);this.model=process.env.LISTENING_MODEL||'deepseek-chat';}
   async complete(system,user){
     if(!this.key) throw Error('请在服务端配置 LISTENING_API_KEY 并重启。');
     const r=await fetch(this.url,{method:'POST',signal:AbortSignal.timeout(60000),headers:{'Content-Type':'application/json',Authorization:'Bearer '+this.key},body:JSON.stringify({model:this.model,messages:[{role:'system',content:system},{role:'user',content:user}],temperature:0.6,max_tokens:4000,response_format:{type:'json_object'}})});
-    if(!r.ok) throw Error('模型服务请求失败（'+r.status+'）。');
-    const data=await r.json();
+    const body=await r.text();
+    if(!r.ok){
+      let detail='';
+      try{const upstream=JSON.parse(body);detail=upstream.error?.message||upstream.message||upstream.detail||'';}catch{}
+      if(!detail&&!body.trimStart().startsWith('<')) detail=body.trim().slice(0,300);
+      throw Error('模型服务请求失败（'+r.status+'）'+(detail?'：'+detail:'。')+' 请求地址：'+this.url);
+    }
+    let data;
+    try{data=JSON.parse(body);}catch{throw Error('模型服务返回了非 JSON 响应，请检查 LISTENING_API_URL。');}
     try{return JSON.parse(data.choices[0].message.content);}catch{throw Error('模型返回无效 JSON。');}
   }
 }
@@ -71,4 +86,4 @@ function createPracticeRouter({provider=new CompatibleGenerator(),ttl=3600000,ca
   router.post('/:id/submit',(req,res)=>{const e=sessions.get(req.params.id);if(!e)return res.status(404).json({error:'练习已过期或服务已重启，请重新生成。'});try{if(!e.result)e.result=score(e.session,req.body?.answers);res.json(e.result);}catch(err){res.status(400).json({error:err.message});}});
   return router;
 }
-module.exports={PRESETS,settingsOf,validateQuestion,generate,publicSession,score,createPracticeRouter};
+module.exports={PRESETS,settingsOf,validateQuestion,generate,publicSession,score,createPracticeRouter,chatCompletionsUrl};
